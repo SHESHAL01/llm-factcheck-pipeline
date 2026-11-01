@@ -1,4 +1,5 @@
 # factcheck.pyS
+import re
 import torch
 import string
 from typing import List, Any
@@ -137,6 +138,9 @@ class EntailmentModel(object):
         self.model = model
         self.tokenizer = tokenizer
         self.cuda = cuda
+        if self.cuda and torch.cuda.is_available():
+            self.model.to("cuda")
+        self.model.eval()
 
     def check_entailment(self, premise: str, hypothesis: str) -> float:
         """
@@ -152,7 +156,7 @@ class EntailmentModel(object):
         with torch.no_grad():
             # Tokenize the premise and hypothesis
             inputs = self.tokenizer(
-                premise, hypothesis, return_tensors="pt", truncation=True, padding=True
+                premise, hypothesis, return_tensors="pt", truncation=True, max_length=256, padding=True
             )
             if self.cuda:
                 inputs = {key: value.to("cuda") for key, value in inputs.items()}
@@ -172,6 +176,38 @@ class EntailmentModel(object):
         gc.collect()
 
         return entailment_prob
+
+    def check_entailment_raw(self, premise: str, hypothesis: str):
+        """
+        Returns full 3-class probability distribution: (P_entailment, P_neutral, P_contradiction).
+        """
+        import torch.nn.functional as F
+
+        with torch.no_grad():
+            inputs = self.tokenizer(
+                premise,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=256,
+                padding=True,
+            )
+            if self.cuda and torch.cuda.is_available():
+                inputs = {key: value.to("cuda") for key, value in inputs.items()}
+            outputs = self.model(**inputs)
+            logits = outputs.logits
+
+        probs = F.softmax(logits, dim=-1)[0]
+        p_ent = probs[0].item()
+        p_neu = probs[1].item()
+        p_con = probs[2].item()
+
+        del inputs, outputs, logits, probs
+        if self.cuda and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        return p_ent, p_neu, p_con
 
 
 class FactChecker(object):
@@ -485,36 +521,44 @@ class WordRecallThresholdFactChecker(FactChecker):
 
 class EntailmentFactChecker(FactChecker):
     """
-    NLI-based fact checker using MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli.
+    Optimized NLI-based fact checker using MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli.
 
     Processing Flow:
-    1. Drop low-overlap passages first (_prune_passages):
-       Uses word overlap to remove passages with little lexical match to the fact.
-       This avoids running the heavy NLI model on clearly irrelevant passages (saves compute, avoids OOM).
-    2. Score each passage sentence-by-sentence (_score_passage_sentences):
-       Splits each surviving passage into sentences and runs NLI on each one individually.
-       This ensures DeBERTa sees every sentence at full capacity instead of truncating long passages.
-    3. Decide S or NS:
-       - threshold strategy: predict S if any sentence scores >= threshold .
-       - discrete strategy:  predict S if any sentence score > 0.50.
+    1. Preprocessing & Artifact Cleaning:
+       Strips section markers (</s><s>), wiki citations, and formatting noise.
+    2. Context-Aware Sentence Decomposition & Pronoun Resolution:
+       Segments passages into sentences and prepends passage titles (e.g. 'Houghton. He was born in Hull.')
+       to resolve anonymous biographical pronouns ('He', 'She', 'They') into explicit named entities.
+       Also constructs adjacent 2-sentence windows to capture cross-sentence co-reference.
+    3. Sentence-Level Lexical Pruning (Part 1 Sieve):
+       Scores each candidate sentence against the claim using stemmed unigram overlap.
+       Sorts and retains only the top-k highest-relevance candidate premises, immediately
+       short-circuiting claims with zero lexical evidence to 'NS'.
+    4. Cross-Encoder NLI Inference with Contradiction Guard:
+       Computes P(entailment) and verifies P(entailment) > P(contradiction) to reject
+       refuted claims.
+    5. Calibrated Threshold Decision:
+       Predicts 'S' if max_entailment >= threshold (default 0.50), else 'NS'.
     """
 
     def __init__(
         self,
         ent_model,
         strategy: str = "threshold",
-        threshold: float = 0.31,
-        prune_threshold: float = 0.03,
+        threshold: float = 0.50,
+        prune_threshold: float = 0.10,
         use_pruning: bool = True,
         sentence_level: bool = True,
+        max_candidates: int = 6,
     ):
         """
-        :param ent_model: DeBERTa entailment model.
+        :param ent_model: DeBERTa entailment model wrapper.
         :param strategy: Decision rule ('threshold' or 'discrete').
-        :param threshold: Score cutoff to predict 'S' (default 0.31).
-        :param prune_threshold: Minimum word overlap to keep a passage (default 0.05).
-        :param use_pruning: Whether to filter out low-overlap passages.
-        :param sentence_level: If True, check passages sentence by sentence to avoid token truncation.
+        :param threshold: Score cutoff to predict 'S' (calibrated default: 0.50).
+        :param prune_threshold: Minimum word overlap to retain a candidate premise (default: 0.10).
+        :param use_pruning: Whether to filter out low-overlap candidate sentences.
+        :param sentence_level: If True, check passages sentence-by-sentence with pronoun resolution.
+        :param max_candidates: Maximum number of top-ranked candidate premises to evaluate with NLI.
         """
         self.ent_model = ent_model
         self.strategy = strategy
@@ -522,150 +566,103 @@ class EntailmentFactChecker(FactChecker):
         self.prune_threshold = prune_threshold
         self.use_pruning = use_pruning
         self.sentence_level = sentence_level
+        self.max_candidates = max_candidates
         self.overlap_checker = WordRecallThresholdFactChecker()
 
-        # Download NLTK sentence splitter data if not already downloaded.
         if self.sentence_level:
             try:
                 nltk.data.find("tokenizers/punkt_tab")
             except LookupError:
                 nltk.download("punkt_tab", quiet=True)
 
-    def _prune_passages(self, fact: str, passages: List[dict]) -> List[dict]:
+    @staticmethod
+    def _clean_passage_text(text: str) -> str:
+        """Removes Wikipedia section delimiters, citation tags, and excess whitespace."""
+        text = re.sub(r"</s><s>|</s>|<s>", " ", text)
+        text = re.sub(r"\[\d+\]|\[citation needed\]", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _extract_candidates(self, fact: str, passages: List[dict]) -> List[str]:
         """
-        Stage 1 Coarse Lexical Pruning Filter.
-
-        Filters candidate passages using word recall overlap before executing
-        deep transformer inference:
-            recall = |fact_tokens ∩ passage_tokens| / |fact_tokens|
-
-        Passages with recall below self.prune_threshold are discarded early,
-        avoiding expensive cross-encoder attention on entirely irrelevant text.
-
-        :param fact: The atomic claim string (hypothesis).
-        :param passages: List of retrieved Wikipedia passage dictionaries.
-        :return: Sublist of passages meeting or exceeding the minimum lexical overlap threshold.
+        Extracts, contextualizes, and prunes candidate premises from retrieved passages.
+        Prepends the passage title to resolve pronouns ('He', 'She', 'They') and
+        evaluates adjacent 2-sentence windows.
         """
-        if not self.use_pruning or not passages:
-            return passages
-
         fact_tokens = self.overlap_checker._preprocess(fact)
         if not fact_tokens:
-            # If the fact has no content tokens after preprocessing, pass all passages through.
-            return passages
+            return []
 
-        surviving = []
-        for p in passages:
-            # Preprocess the passage text using the same pipeline as the fact.
-            p_tokens = self.overlap_checker._preprocess(p.get("text", ""))
-            # Compute unigram recall: fraction of fact tokens covered by the passage.
-            overlap = self.overlap_checker._recall(fact_tokens, p_tokens)
-            if overlap >= self.prune_threshold:
-                surviving.append(p)
-
-        # Safety: if pruning removes all passages, fall back to all passages.
-        # This prevents trivially predicting NS for every fact when evidence is paraphrased.
-        return surviving if surviving else passages
-
-    def _score_passage_sentences(self, fact: str, passage_text: str) -> float:
-        """
-        Stage 2 Sentence-Level NLI Decomposition.
-
-        Splits a single Wikipedia passage into individual sentences using
-        nltk.sent_tokenize() and runs the DeBERTa NLI model on each (sentence, fact) pair independently.
-        Returns the maximum P(entailment) found across all sentences in the passage.
-
-        Reason:
-          - DeBERTa-v3-base has a hard 512-token limit. A Wikipedia passage can easily
-            exceed this, and the transformer silently truncates from the right.
-          - The sentence that actually supports the claim is often buried mid-passage or
-            near the end — exactly where truncation strikes.
-          - By scoring each sentence individually we guarantee every potential evidence
-            unit is seen by the model at its full attention capacity.
-
-        :param fact: The atomic claim string (hypothesis).
-        :param passage_text: The full text of one Wikipedia passage (premise).
-        :return: Maximum P(entailment | sentence, fact) across all sentences in the passage.
-        """
-        # Split the passage into sentences using NLTK's Punkt tokenizer.
-        sentences = nltk.sent_tokenize(passage_text)
-
-        # If tokenization produces nothing, fall back to the full passage as a single unit.
-        if not sentences:
-            return self.ent_model.check_entailment(passage_text, fact)
-
-        max_score = 0.0
-        for sentence in sentences:
-            # Skip very short sentences that carry no meaningful semantic content for entailment judgement.
-            if len(sentence.split()) < 4:
+        candidates = []
+        for passage in passages:
+            title = passage.get("title", "").strip()
+            raw_text = passage.get("text", "")
+            if not raw_text:
                 continue
 
-            # premise = individual sentence, hypothesis = atomic fact.
-            score = self.ent_model.check_entailment(sentence, fact)
-            if score > max_score:
-                max_score = score
+            clean_text = self._clean_passage_text(raw_text)
+            sentences = nltk.sent_tokenize(clean_text)
 
-            # Early exit: if any sentence strongly entails the fact, no need to continue checking the remaining sentences in this passage.
-            if max_score >= 0.95:
-                break
+            for i, sent in enumerate(sentences):
+                s_clean = sent.strip()
+                if len(s_clean.split()) < 3:
+                    continue
 
-        return max_score
+                # Single sentence with title prepended
+                premise = f"{title}. {s_clean}" if title else s_clean
+                prem_tokens = self.overlap_checker._preprocess(premise)
+                overlap = self.overlap_checker._recall(fact_tokens, prem_tokens)
+                candidates.append((overlap, premise))
 
-    def _get_best_passage_score(self, fact: str, passage: dict) -> float:
-        """
-        Helper that consider either sentence-level or full-passage NLI scoring
-        depending on the self.sentence_level flag.
+                # Sliding 2-sentence window
+                if i > 0:
+                    win_text = f"{sentences[i-1].strip()} {s_clean}"
+                    win_premise = f"{title}. {win_text}" if title else win_text
+                    win_tokens = self.overlap_checker._preprocess(win_premise)
+                    win_ov = self.overlap_checker._recall(fact_tokens, win_tokens)
+                    candidates.append((win_ov, win_premise))
 
-        :param fact: The atomic claim string (hypothesis).
-        :param passage: A single Wikipedia passage dict with key 'text'.
-        :return: Maximum P(entailment) for this passage.
-        """
-        passage_text = passage.get("text", "")
-        if not passage_text:
-            return 0.0
+        if not candidates:
+            return []
 
-        if self.sentence_level:
-            # Sentence-level decomposition: score each sentence independently.
-            return self._score_passage_sentences(fact, passage_text)
-        else:
-            # Baseline: pass the full passage text as the NLI premise.
-            # Prone to truncation for passages longer than 512 tokens.
-            return self.ent_model.check_entailment(passage_text, fact)
+        if not self.use_pruning:
+            return [c[1] for c in candidates]
+
+        # Sentence-level lexical pruning: filter and sort by overlap
+        surviving = [c for c in candidates if c[0] >= self.prune_threshold]
+        if not surviving:
+            return []
+
+        surviving.sort(key=lambda x: x[0], reverse=True)
+        return [c[1] for c in surviving[: self.max_candidates]]
 
     def predict_threshold(self, fact: str, passages: List[dict], threshold: float = None) -> str:
         """
-        Strategy 1: Continuous Probability Thresholding with Max-Pooling.
-
-        For each surviving passage, obtains the best P(entailment) via sentence-level
-        decomposition (or full-passage if sentence_level=False). Aggregates across all
-        passages using max-pooling:
-
-            max_entailment = max_{p in passages} max_{s in sentences(p)} P(entailment | s, fact)
-
-        Decision Rule:
-            Predict 'S' if max_entailment >= threshold, else 'NS'.
-
-        :param fact: The atomic claim string.
-        :param passages: List of retrieved Wikipedia passage dicts.
-        :param threshold: Optional threshold override (defaults to self.threshold = 0.30).
-        :return: 'S' (Supported) or 'NS' (Not Supported).
+        Strategy 1: Continuous Probability Thresholding with Max-Pooling and Contradiction Guard.
         """
         thresh = threshold if threshold is not None else self.threshold
 
-        # Stage 1: discard clearly irrelevant passages using lexical recall.
-        surviving = self._prune_passages(fact, passages)
-        if not surviving:
+        if not self.sentence_level:
+            # Baseline full passage evaluation
+            max_score = 0.0
+            for p in passages:
+                p_text = self._clean_passage_text(p.get("text", ""))
+                score = self.ent_model.check_entailment(p_text, fact)
+                max_score = max(max_score, score)
+            return "S" if max_score >= thresh else "NS"
+
+        candidate_premises = self._extract_candidates(fact, passages)
+        if not candidate_premises:
             return "NS"
 
         max_entailment = 0.0
-        for passage in surviving:
-            # Stage 2: score the passage
-            score = self._get_best_passage_score(fact, passage)
-            if score > max_entailment:
-                max_entailment = score
+        for premise in candidate_premises:
+            p_ent, p_neu, p_con = self.ent_model.check_entailment_raw(premise, fact)
+            # Contradiction guard: entailment must strictly exceed contradiction
+            if p_ent > p_con and p_ent > max_entailment:
+                max_entailment = p_ent
 
-            # Cross-passage early exit: a very high score from any passage means we
-            # can confidently predict 'S' without scoring the remaining passages.
+            # Early stopping on decisive entailment
             if max_entailment >= 0.95:
                 break
 
@@ -674,42 +671,26 @@ class EntailmentFactChecker(FactChecker):
     def predict_discrete(self, fact: str, passages: List[dict]) -> str:
         """
         Strategy 2: Discrete Entailment Classification.
-
-        Maps model output to a hard binary decision. A fact is considered Supported
-        if the DeBERTa model's argmax prediction is 'entailment' for at least one
-        sentence from at least one surviving passage.
-
-        Because the 3-class softmax sums to 1.0, argmax == entailment iff
-        P(entailment) > 0.50 (assuming it is strictly the maximum of the three classes).
-
-        :param fact: The atomic claim string.
-        :param passages: List of retrieved Wikipedia passage dicts.
-        :return: 'S' (Supported) or 'NS' (Not Supported).
+        Predicts 'S' if discrete argmax is 'entailment' (p_ent > p_neu and p_ent > p_con).
         """
-        # Stage 1: lexical pruning.
-        surviving = self._prune_passages(fact, passages)
-        if not surviving:
+        candidate_premises = self._extract_candidates(fact, passages)
+        if not candidate_premises:
             return "NS"
 
-        for passage in surviving:
-            # Stage 2: get best sentence-level score for this passage.
-            score = self._get_best_passage_score(fact, passage)
-            # Discrete rule: argmax == entailment iff P(entailment) > 0.50.
-            if score > 0.50:
+        for premise in candidate_premises:
+            p_ent, p_neu, p_con = self.ent_model.check_entailment_raw(premise, fact)
+            if p_ent > p_neu and p_ent > p_con:
                 return "S"
 
         return "NS"
 
     def predict(self, fact: str, passages: List[dict]) -> str:
         """
-        :param fact: The atomic claim string.
-        :param passages: List of retrieved Wikipedia passage dicts.
-        :return: 'S' (Supported) or 'NS' (Not Supported).
+        Executes prediction using the configured strategy ('threshold' or 'discrete').
         """
         if self.strategy == "discrete":
             return self.predict_discrete(fact, passages)
         else:
-            # Default: continuous threshold strategy with sentence-level NLI.
             return self.predict_threshold(fact, passages)
 
 

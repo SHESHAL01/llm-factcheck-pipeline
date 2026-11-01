@@ -24,6 +24,10 @@ except LookupError:
 
 
 def _patch_main_for_comparison():
+    """
+    Monkey-patches predict_two_classes and print_eval_stats in __main__ to automatically run
+    a side-by-side comparison between Stemming and Lemmatization during word_overlap evaluation.
+    """
     main_mod = sys.modules.get('__main__')
     if not main_mod or not hasattr(main_mod, 'predict_two_classes') or not hasattr(main_mod, 'print_eval_stats'):
         return
@@ -133,8 +137,19 @@ class FactExample(object):
 
 
 class EntailmentModel(object):
+    """
+    Cross-Encoder NLI model wrapper for sequence classification models (e.g. DeBERTa, RoBERTa).
+    Computes continuous entailment probabilities and 3-class distributions for (premise, hypothesis) pairs.
+    """
 
-    def __init__(self, model, tokenizer, cuda=False):
+    def __init__(self, model, tokenizer, cuda: bool = False):
+        """
+        Initializes the pre-trained Cross-Encoder NLI model wrapper.
+
+        :param model: Pre-trained HuggingFace sequence classification model (e.g., DeBERTa or RoBERTa).
+        :param tokenizer: HuggingFace tokenizer associated with the model.
+        :param cuda: Whether to enable CUDA/GPU acceleration for inference.
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.cuda = cuda
@@ -146,10 +161,10 @@ class EntailmentModel(object):
         """
         Executes NLI inference for a (premise, hypothesis) pair using the pre-trained cross-encoder.
         Returns the continuous entailment probability P(entailment) as a standard float in [0.0, 1.0].
-        
-        :param premise: Evidence text (Wikipedia passage).
+
+        :param premise: Evidence text (contextualized Wikipedia passage or sentence).
         :param hypothesis: Atomic claim to verify (ChatGPT proposition).
-        :return: float representing P(entailment).
+        :return: Continuous entailment probability score between 0.0 and 1.0.
         """
         import torch.nn.functional as F
 
@@ -179,7 +194,11 @@ class EntailmentModel(object):
 
     def check_entailment_raw(self, premise: str, hypothesis: str):
         """
-        Returns full 3-class probability distribution: (P_entailment, P_neutral, P_contradiction).
+        Computes the full 3-class probability distribution: (P_entailment, P_neutral, P_contradiction).
+
+        :param premise: Evidence text (contextualized passage or sentence).
+        :param hypothesis: Atomic claim to verify (ChatGPT proposition).
+        :return: Tuple of (P_entailment, P_neutral, P_contradiction) probabilities summing to 1.0.
         """
         import torch.nn.functional as F
 
@@ -218,26 +237,55 @@ class FactChecker(object):
     def predict(self, fact: str, passages: List[dict]) -> str:
         """
         Makes a prediction on the given sentence
-        :param fact: same as FactExample
-        :param passages: same as FactExample
-        :return: "S" (supported) or "NS" (not supported)
+
+        :param fact: The atomic proposition or sentence to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: "S" (supported) or "NS" (not supported).
         """
         raise Exception("Don't call me, call my subclasses")
 
 
 class RandomGuessFactChecker(FactChecker):
     def predict(self, fact: str, passages: List[dict]) -> str:
+        """
+        Randomly predicts 'S' or 'NS' with equal probability.
+
+        :param fact: The atomic proposition to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: Random prediction string ('S' or 'NS').
+        """
         prediction = np.random.choice(["S", "NS"])
         return prediction
 
 
 class AlwaysEntailedFactChecker(FactChecker):
     def predict(self, fact: str, passages: List[dict]) -> str:
+        """
+        Trivially predicts 'S' for all instances (majority/trivial baseline).
+
+        :param fact: The atomic proposition to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: Constant prediction string 'S'.
+        """
         return "S"
 
 
 class WordRecallThresholdFactChecker(FactChecker):
     THRESHOLD = 0.6
+
+    @staticmethod
+    def _clean_passage_text(text: str) -> str:
+        """
+        Removes Wikipedia section delimiters, citation tags, and excess whitespace.
+        Used as an initial text preprocessing step for both claims and retrieved passages.
+
+        :param text: Raw input text string (claim or evidence passage).
+        :return: Sanitized string with HTML/Wikipedia artifacts stripped and whitespace normalized.
+        """
+        text = re.sub(r"</s><s>|</s>|<s>", " ", text)
+        text = re.sub(r"\[\d+\]|\[citation needed\]", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
     def __init__(
         self,
@@ -250,9 +298,9 @@ class WordRecallThresholdFactChecker(FactChecker):
         use_lemmatization: bool = False,
     ):
         """
-        Word Overlap.
+        Initializes the Word Overlap Fact Checker baseline with configurable lexical preprocessing.
 
-        :param threshold: Decision boundary threshold .
+        :param threshold: Decision boundary threshold (predict 'S' if overlap score >= threshold, else 'NS').
         :param metric: Scoring metric to use: 'recall', 'jaccard', or 'f1'.
         :param aggregation: Multi-passage aggregation strategy: 'max' (taking max score across
                             passages) or 'concat' (scoring against concatenated passages).
@@ -278,16 +326,15 @@ class WordRecallThresholdFactChecker(FactChecker):
     def _preprocess(self, text: str) -> set:
         """
         Converts raw text into a clean set of tokens for lexical overlap comparison.
+        Applies passage artifact cleaning, optional lowercasing, punctuation normalization,
+        stopword filtering, and Porter stemming.
 
-        Fixes applied:
-        1. Comprehensive punctuation handling via string.punctuation.
-        2. Replaces punctuation with whitespace (' ') instead of empty string ('')
-           to prevent unintended word concatenation (e.g., 'actor,singer' -> 'actor singer',
-           'Under-19' -> 'under 19').
-        3. Properly removes individual brackets and parentheses rather than searching
-           for adjacent pairs ('()', '[]', '{}').
-        4. Configurable lowercasing, stopword filtering, and Porter stemming for ablation studies.
+        :param text: Raw input text string (claim or evidence passage).
+        :return: Set of preprocessed, stemmed token strings.
         """
+        # Clean Wikipedia delimiters, citations, and excess whitespace
+        text = self._clean_passage_text(text)
+
         if self.lowercase:
             text = text.lower()
 
@@ -309,9 +356,18 @@ class WordRecallThresholdFactChecker(FactChecker):
         return set(tokens)
 
     def _preprocess_with_lemm(self, text: str) -> set:
-        """Identical to _preprocess() — only the stemming line is replaced with lemmatization."""
+        """
+        Converts raw text into a clean set of tokens using WordNet lemmatization.
+        Applies passage artifact cleaning, lowercasing, punctuation stripping,
+        stopword filtering, and verb lemmatization.
 
-        #  lowercase + remove punctuation
+        :param text: Raw input text string (claim or evidence passage).
+        :return: Set of preprocessed, lemmatized token strings.
+        """
+        # Clean Wikipedia delimiters, citations, and excess whitespace
+        text = self._clean_passage_text(text)
+
+        # lowercase + remove punctuation
         text = text.lower()
 
         for punc in [",", "!", ".", "?", ":", ";", "()", "[]", "{}", "'", "\"", "@", "#", "$", "%", "^", "&", "*", "~"]:
@@ -323,15 +379,19 @@ class WordRecallThresholdFactChecker(FactChecker):
         # Remove stop words
         tokens = [token for token in tokens if token not in self.stop_words]
 
-        # ONLY THIS LINE CHANGED: Lemmatization with pos='v' to handle verbs
+        # Lemmatization with pos='v' to handle verbs
         tokens = [self.lemmatizer.lemmatize(token, pos='v') for token in tokens]
 
         return set(tokens)
 
     def _recall(self, fact_tokens: set, passage_tokens: set) -> float:
         """
-        Calculates recall score: |fact_tokens ∩ passage_tokens| / |fact_tokens|.
+        Calculates token-level recall score: |fact_tokens ∩ passage_tokens| / |fact_tokens|.
         Measures the proportion of atomic fact tokens covered by the evidence passage.
+
+        :param fact_tokens: Set of preprocessed tokens representing the claim/fact.
+        :param passage_tokens: Set of preprocessed tokens representing the evidence passage.
+        :return: Recall score as a float in [0.0, 1.0].
         """
         if not fact_tokens:
             return 0.0
@@ -339,7 +399,11 @@ class WordRecallThresholdFactChecker(FactChecker):
 
     def _jaccard(self, fact_tokens: set, passage_tokens: set) -> float:
         """
-        Calculates Jaccard similarity: |fact_tokens ∩ passage_tokens| / |fact_tokens ∪ passage_tokens|.
+        Calculates Jaccard similarity coefficient: |fact_tokens ∩ passage_tokens| / |fact_tokens ∪ passage_tokens|.
+
+        :param fact_tokens: Set of preprocessed tokens representing the claim/fact.
+        :param passage_tokens: Set of preprocessed tokens representing the evidence passage.
+        :return: Jaccard similarity coefficient as a float in [0.0, 1.0].
         """
         union = fact_tokens | passage_tokens
         if not union:
@@ -349,6 +413,10 @@ class WordRecallThresholdFactChecker(FactChecker):
     def _f1(self, fact_tokens: set, passage_tokens: set) -> float:
         """
         Calculates token-level F1 score (harmonic mean of precision and recall).
+
+        :param fact_tokens: Set of preprocessed tokens representing the claim/fact.
+        :param passage_tokens: Set of preprocessed tokens representing the evidence passage.
+        :return: F1 score as a float in [0.0, 1.0].
         """
         intersection = fact_tokens & passage_tokens
         if not intersection:
@@ -359,7 +427,11 @@ class WordRecallThresholdFactChecker(FactChecker):
 
     def predict(self, fact: str, passages: List[dict]) -> str:
         """
-        Predicts 'S' (Supported) or 'NS' (Not Supported) based on lexical overlap score.
+        Predicts whether an atomic fact is supported ('S') or not supported ('NS') by retrieved passages.
+
+        :param fact: The atomic proposition or sentence to verify.
+        :param passages: List of retrieved evidence passages, each a dictionary containing 'title' and 'text'.
+        :return: 'S' if lexical overlap exceeds the decision threshold, otherwise 'NS'.
         """
         preprocess_fn = (
             self._preprocess_with_lemm if self.use_lemmatization else self._preprocess
@@ -552,13 +624,15 @@ class EntailmentFactChecker(FactChecker):
         max_candidates: int = 6,
     ):
         """
-        :param ent_model: DeBERTa entailment model wrapper.
-        :param strategy: Decision rule ('threshold' or 'discrete').
-        :param threshold: Score cutoff to predict 'S' (calibrated default: 0.50).
-        :param prune_threshold: Minimum word overlap to retain a candidate premise (default: 0.10).
-        :param use_pruning: Whether to filter out low-overlap candidate sentences.
-        :param sentence_level: If True, check passages sentence-by-sentence with pronoun resolution.
-        :param max_candidates: Maximum number of top-ranked candidate premises to evaluate with NLI.
+        Initializes the Textual Entailment Fact Checker pipeline with multi-stage reasoning.
+
+        :param ent_model: DeBERTa/RoBERTa entailment model wrapper (instance of EntailmentModel).
+        :param strategy: Decision rule ('threshold' for continuous probability thresholding, or 'discrete' for 3-class argmax).
+        :param threshold: Continuous probability decision boundary (predict 'S' if max P(entailment) >= threshold).
+        :param prune_threshold: Minimum lexical overlap score required to retain a candidate premise sentence (default: 0.10).
+        :param use_pruning: Whether to filter out low-overlap candidate sentences prior to transformer NLI inference.
+        :param sentence_level: If True, evaluates passage sentences individually with pronoun resolution and sliding windows; if False, evaluates full passages.
+        :param max_candidates: Maximum number of top-ranked candidate premises to evaluate with NLI per claim (default: 6).
         """
         self.ent_model = ent_model
         self.strategy = strategy
@@ -577,17 +651,24 @@ class EntailmentFactChecker(FactChecker):
 
     @staticmethod
     def _clean_passage_text(text: str) -> str:
-        """Removes Wikipedia section delimiters, citation tags, and excess whitespace."""
-        text = re.sub(r"</s><s>|</s>|<s>", " ", text)
-        text = re.sub(r"\[\d+\]|\[citation needed\]", "", text)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        """
+        Removes Wikipedia section delimiters, citation tags, and excess whitespace.
+        Delegates to WordRecallThresholdFactChecker._clean_passage_text.
+
+        :param text: Raw text string from the passage or claim.
+        :return: Sanitized string with markup and citations stripped.
+        """
+        return WordRecallThresholdFactChecker._clean_passage_text(text)
 
     def _extract_candidates(self, fact: str, passages: List[dict]) -> List[str]:
         """
         Extracts, contextualizes, and prunes candidate premises from retrieved passages.
-        Prepends the passage title to resolve pronouns ('He', 'She', 'They') and
-        evaluates adjacent 2-sentence windows.
+        Prepends passage titles to resolve biographical pronouns ('He', 'She', 'They'),
+        constructs adjacent 2-sentence windows, and filters candidates via lexical overlap.
+
+        :param fact: The atomic claim to verify.
+        :param passages: List of retrieved evidence passages (each dict containing 'title' and 'text').
+        :return: List of top-k contextualized candidate premise strings sorted by lexical relevance.
         """
         fact_tokens = self.overlap_checker._preprocess(fact)
         if not fact_tokens:
@@ -638,7 +719,12 @@ class EntailmentFactChecker(FactChecker):
 
     def predict_threshold(self, fact: str, passages: List[dict], threshold: float = None) -> str:
         """
-        Strategy 1: Continuous Probability Thresholding with Max-Pooling and Contradiction Guard.
+        Continuous Probability Thresholding with Max-Pooling and Contradiction Guard.
+
+        :param fact: The atomic claim to verify.
+        :param passages: List of retrieved evidence passages.
+        :param threshold: Optional override for the decision threshold; defaults to self.threshold.
+        :return: 'S' if max P(entailment) >= threshold and P(entailment) > P(contradiction), else 'NS'.
         """
         thresh = threshold if threshold is not None else self.threshold
 
@@ -670,8 +756,12 @@ class EntailmentFactChecker(FactChecker):
 
     def predict_discrete(self, fact: str, passages: List[dict]) -> str:
         """
-        Strategy 2: Discrete Entailment Classification.
-        Predicts 'S' if discrete argmax is 'entailment' (p_ent > p_neu and p_ent > p_con).
+        Discrete 3-Class Entailment Classification Strategy.
+        Predicts 'S' if any candidate premise produces argmax = 'entailment' (P_ent > P_neu and P_ent > P_con).
+
+        :param fact: The atomic claim to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: 'S' if any candidate premise strictly entails the claim, else 'NS'.
         """
         candidate_premises = self._extract_candidates(fact, passages)
         if not candidate_premises:
@@ -686,7 +776,12 @@ class EntailmentFactChecker(FactChecker):
 
     def predict(self, fact: str, passages: List[dict]) -> str:
         """
-        Executes prediction using the configured strategy ('threshold' or 'discrete').
+        Makes a factual verification prediction on the given fact using retrieved passages.
+        Dispatches to predict_discrete or predict_threshold based on self.strategy.
+
+        :param fact: The atomic claim to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: 'S' (Supported) or 'NS' (Not Supported).
         """
         if self.strategy == "discrete":
             return self.predict_discrete(fact, passages)
@@ -697,9 +792,19 @@ class EntailmentFactChecker(FactChecker):
 # OPTIONAL
 class DependencyRecallThresholdFactChecker(FactChecker):
     def __init__(self):
+        """
+        Initializes the dependency parser fact checker using spaCy English core model.
+        """
         self.nlp = spacy.load("en_core_web_sm")
 
     def predict(self, fact: str, passages: List[dict]) -> str:
+        """
+        Predicts 'S' or 'NS' based on dependency relation overlap.
+
+        :param fact: The atomic proposition or sentence to verify.
+        :param passages: List of retrieved evidence passages.
+        :return: 'S' or 'NS'.
+        """
         raise Exception("Implement me")
 
     def get_dependencies(self, sent: str):
@@ -745,6 +850,12 @@ class DatasetEDA(object):
 
     def __init__(self, dev_path: str = "data/dev_labeled_ChatGPT.jsonl",
                  passages_path: str = "data/passages_bm25_ChatGPT_humfacts.jsonl"):
+        """
+        Initializes EDA loader with file paths to development facts and retrieved passages.
+
+        :param dev_path: Path to the JSONL file containing labeled ChatGPT atomic facts.
+        :param passages_path: Path to the JSONL file containing BM25 retrieved evidence passages.
+        """
         self.dev_path = dev_path
         self.passages_path = passages_path
         self.raw_biographies = []
@@ -840,7 +951,11 @@ class DatasetEDA(object):
             f"Words per Passage      : Min={min(passage_words)}, Max={max(passage_words)}, Mean={statistics.mean(passage_words):.2f}")
 
     def print_vocabulary_analysis(self, top_n: int = 10):
-        """Examines the raw lexical space to justify subsequent preprocessing."""
+        """
+        Examines the raw lexical space to justify subsequent preprocessing.
+
+        :param top_n: Number of top most frequent tokens to display (default: 10).
+        """
         from collections import Counter
         vocab = Counter()
         for f in self.raw_facts:
@@ -988,6 +1103,8 @@ class DatasetEDA(object):
         """
         Generates and saves visual EDA plots (both individual figures and master dashboards)
         to the specified directory for coursework reports.
+
+        :param output_dir: Directory where generated visualization figures are saved (default: 'eda_plots').
         """
         try:
             import matplotlib
@@ -1350,6 +1467,8 @@ class DatasetEDA(object):
         Benchmarks different similarity & preprocessing methods (Word Recall,
         TF-IDF Cosine, ROUGE-1, ROUGE-2, ROUGE-L) on the dataset and prints
         a comparative evaluation table with optimal decision thresholds.
+
+        :param output_dir: Directory where metric comparison plots are saved (default: 'eda_plots').
         """
         import os
         import numpy as np
@@ -1560,6 +1679,10 @@ class DatasetEDA(object):
     def run_cross_validation(self, k: int = 5, seed: int = 42):
         """
         Executes k-fold cross-validation on the dev set to validate threshold stability.
+
+        :param k: Number of cross-validation folds (default: 5).
+        :param seed: Random seed for fold partitioning (default: 42).
+        :return: Dict containing fold metrics, mean validation accuracy, and mean optimal threshold.
         """
         examples = []
         for f in self.raw_facts:
@@ -1569,7 +1692,13 @@ class DatasetEDA(object):
         return WordRecallThresholdFactChecker.cross_validate(examples, k=k, seed=seed, verbose=True)
 
     def run(self, generate_plots: bool = True, compare_metrics: bool = True, run_cv: bool = True):
-        """Executes all EDA routines sequentially, including benchmark and plot generation."""
+        """
+        Executes all EDA routines sequentially, including benchmark and plot generation.
+
+        :param generate_plots: Whether to generate and save PNG plot files.
+        :param compare_metrics: Whether to benchmark multiple similarity metrics.
+        :param run_cv: Whether to execute k-fold cross-validation.
+        """
         print("\n>>> Running Full Dataset EDA (Before Preprocessing) <<<")
         self.load_data()
         self.print_topic_overview()

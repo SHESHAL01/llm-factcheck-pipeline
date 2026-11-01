@@ -11,6 +11,7 @@ env/
 # IDE / Editor configuration
 .idea/
 .vscode/
+Course Work.iml
 
 # Environment variables & secrets
 .env
@@ -22,3 +23,6 @@ env/
 # *.pt
 # *.pth
 # *.bin
+
+main.py
+scratch results/test_lem.py

@@ -370,8 +370,8 @@ class WordRecallThresholdFactChecker(FactChecker):
         # lowercase + remove punctuation
         text = text.lower()
 
-        for punc in [",", "!", ".", "?", ":", ";", "()", "[]", "{}", "'", "\"", "@", "#", "$", "%", "^", "&", "*", "~"]:
-            text = text.replace(punc, "")
+        for punc in string.punctuation:
+            text = text.replace(punc, " ")
 
         # Tokenize
         tokens = text.split()
